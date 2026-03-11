@@ -99,4 +99,8 @@ python main.py --debug    # 调试模式，打印所有拦截到的 API 数据
 
 ## 📄 License
 
-MIT
+本项目基于 [GNU Affero General Public License v3.0](LICENSE) 发布。
+
+本程序是自由软件：您可以按照自由软件基金会发布的 GNU Affero 通用公共许可证第 3 版或（由您选择）更高版本的条款重新分发和/或修改它。本程序不附带任何担保。
+
+如果您修改本程序并通过网络提供服务，您必须向用户提供修改后的完整源代码。

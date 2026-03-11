@@ -1,3 +1,17 @@
+# ZCST Fee Bot — 宿舍费用监控 & 充值机器人
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 main.py  —  宿舍费用机器人入口
 
@@ -54,7 +68,16 @@ def _check_once(cfg: dict, debug: bool = False) -> None:
             logger.info(f"  {label}：{val:.2f} {unit}{warn}")
 
 
+_LICENSE_NOTICE = """\
+ZCST Fee Bot  Copyright (C) 2026  ZCST Fee Bot Contributors
+本程序是自由软件，您可以按照 GNU Affero 通用公共许可证第 3 版或
+（由您选择）更高版本的条款重新分发和/或修改它。
+本程序不附带任何担保。详情请参阅 LICENSE 文件。
+"""
+
+
 def main() -> None:
+    print(_LICENSE_NOTICE)
     parser = argparse.ArgumentParser(description="宿舍电费/水费余额监控机器人")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--once", action="store_true", help="只查询一次余额后退出")
