@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# 日志
+bot.log
+*.log
+
+# 配置（含密钥/token，不要提交）
+config.yaml
+
+# Playwright 浏览器缓存
+.playwright/
+
+# IDE
+.vscode/
+.idea/

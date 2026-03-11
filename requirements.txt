@@ -1,0 +1,4 @@
+playwright>=1.40.0
+pyyaml>=6.0
+loguru>=0.7.0
+python-telegram-bot[job-queue]>=20.0
