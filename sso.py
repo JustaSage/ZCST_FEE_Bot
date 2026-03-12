@@ -113,9 +113,36 @@ async def _login_and_get_url(page, login_url: str, username: str, password: str)
     # appWebLogin.jsp 会多次重定向，先导航再用 locator 等待最终表单
     await page.goto(login_url, timeout=60_000)
 
-    # 等待可见的密码输入框出现（说明重定向已完成，登录表单已渲染）
-    pwd_locator = page.locator("input[type='password']")
-    await pwd_locator.first.wait_for(state="visible", timeout=30_000)
+    # 等待登录表单渲染：尝试多种密码输入框选择器
+    _pwd_selectors = [
+        "input[type='password']",
+        "input[placeholder*='密码']",
+        "input[name='password']",
+        "input#password",
+    ]
+    pwd_el = None
+    for _ in range(60):  # 最多等 30 秒（每次 500ms）
+        for sel in _pwd_selectors:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                pwd_el = el
+                break
+        if pwd_el:
+            break
+        await page.wait_for_timeout(500)
+
+    if not pwd_el:
+        # 截图辅助调试
+        try:
+            await page.screenshot(path="_debug_sso_login.png")
+            logger.error(f"SSO 登录页截图已保存为 _debug_sso_login.png，当前 URL: {page.url}")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"登录页面未找到密码输入框（当前 URL: {page.url}）\n"
+            "可能原因：学校 SSO 页面结构已更新或链接无法访问"
+        )
+
     await page.wait_for_timeout(500)
 
     # ── 切到「用户名密码」Tab（某些学校默认手机验证码 Tab） ──
@@ -143,17 +170,10 @@ async def _login_and_get_url(page, login_url: str, username: str, password: str)
     if not username_el:
         raise RuntimeError("未找到用户名输入框，登录页结构可能已变更")
 
-    # ── 填写密码 ──
-    password_el = await _find_visible(page, [
-        "input[type='password']",
-        "input[placeholder*='密码']",
-    ])
-    if not password_el:
-        raise RuntimeError("未找到密码输入框，登录页结构可能已变更")
-
+    # ── 填写密码（已在上方找到 pwd_el） ──
     await username_el.fill(username)
     await page.wait_for_timeout(200)
-    await password_el.fill(password)
+    await pwd_el.fill(password)
     await page.wait_for_timeout(200)
 
     # ── 点击登录 ──
