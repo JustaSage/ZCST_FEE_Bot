@@ -13,8 +13,18 @@ bot.log
 # 配置（含密钥/token，不要提交）
 config.yaml
 
+# 用户数据（含查询链接等敏感信息）
+users.json
+users.json.tmp
+
 # Playwright 浏览器缓存
 .playwright/
+
+# 调试产物
+_debug_*.png
+
+# 旧项目目录（已合入 sso.py）
+ZCST_FEE/
 
 # IDE
 .vscode/

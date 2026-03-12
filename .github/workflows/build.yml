@@ -1,28 +1,19 @@
-name: Build Release
+name: CI
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - os: windows-latest
-            artifact: zcst-fee-bot-windows
-            ext: .exe
-          - os: ubuntu-latest
-            artifact: zcst-fee-bot-linux
-            ext: ""
-
-    runs-on: ${{ matrix.os }}
-
+  check:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -32,51 +23,33 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pyinstaller
+        run: pip install -r requirements.txt
 
-      - name: Build executable
-        run: |
-          pyinstaller --noconfirm --onefile --name fee-bot main.py
-
-      - name: Prepare archive (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          cp config.yaml.example dist/config.yaml.example
-          cp README.md dist/README.md
-          cd dist && tar czf ../${{ matrix.artifact }}.tar.gz *
-
-      - name: Prepare archive (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          Copy-Item config.yaml.example dist/config.yaml.example
-          Copy-Item README.md dist/README.md
-          Compress-Archive -Path dist/* -DestinationPath ${{ matrix.artifact }}.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.zip
-          if-no-files-found: ignore
+      - name: Syntax check
+        run: python -m py_compile main.py bot.py fetcher.py config.py store.py sso.py
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: check
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
+      - uses: actions/checkout@v4
+
+      - name: Create source archive
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          mkdir -p dist
+          tar czf dist/zcst-fee-bot-${VERSION}.tar.gz \
+            --transform "s,^,zcst-fee-bot-${VERSION}/," \
+            *.py config.yaml.example pyproject.toml requirements.txt \
+            LICENSE README.md
+          cd dist && zip -r zcst-fee-bot-${VERSION}.zip ../LICENSE ../README.md \
+            ../config.yaml.example ../pyproject.toml ../requirements.txt ../*.py
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: |
-            zcst-fee-bot-windows.zip
-            zcst-fee-bot-linux.tar.gz
+            dist/zcst-fee-bot-*.tar.gz
+            dist/zcst-fee-bot-*.zip

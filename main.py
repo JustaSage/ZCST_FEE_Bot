@@ -43,9 +43,8 @@ _LABELS = {
 }
 
 
-def _check_once(cfg: dict, debug: bool = False) -> None:
+def _check_once(url: str, cfg: dict, debug: bool = False) -> None:
     """执行一次余额检查（CLI 测试用）。"""
-    url = cfg["url"]
     field_mapping: dict = cfg.get("field_mapping") or {}
 
     logger.info("开始检查余额…")
@@ -69,7 +68,6 @@ def _check_once(cfg: dict, debug: bool = False) -> None:
 
 
 _LICENSE_NOTICE = """\
-ZCST Fee Bot  Copyright (C) 2026  ZCST Fee Bot Contributors
 本程序是自由软件，您可以按照 GNU Affero 通用公共许可证第 3 版或
 （由您选择）更高版本的条款重新分发和/或修改它。
 本程序不附带任何担保。详情请参阅 LICENSE 文件。
@@ -80,6 +78,7 @@ def main() -> None:
     print(_LICENSE_NOTICE)
     parser = argparse.ArgumentParser(description="宿舍电费/水费余额监控机器人")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+    parser.add_argument("--url", help="17wanxiao 查询链接（配合 --once/--debug 使用）")
     parser.add_argument("--once", action="store_true", help="只查询一次余额后退出")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     args = parser.parse_args()
@@ -97,19 +96,17 @@ def main() -> None:
 
     # --once / --debug：仅查询余额并退出
     if args.once or args.debug:
-        _check_once(cfg, debug=args.debug)
+        url = args.url or cfg.get("url", "")
+        if not url:
+            logger.error(
+                "CLI 模式需要指定查询链接。\n"
+                "  用法：python main.py --once --url <你的17wanxiao链接>"
+            )
+            sys.exit(1)
+        _check_once(url, cfg, debug=args.debug)
         return
 
     # 正常模式：启动 Telegram Bot
-    token = cfg.get("telegram", {}).get("bot_token", "").strip()
-    if not token:
-        logger.error(
-            "请先在 config.yaml 中配置 telegram.bot_token。\n"
-            "  1. 在 Telegram 搜索 @BotFather 创建 Bot\n"
-            "  2. 将获取到的 token 填入 config.yaml"
-        )
-        sys.exit(1)
-
     from bot import create_bot
 
     app = create_bot(cfg)

@@ -220,9 +220,13 @@ _JS_HOOK_SHOW_MODAL = """() => {
     }
 }"""
 
-# 支付链接拦截模式：捕获 URL 但不访问，保留给用户使用
+# 支付链接拦截模式：捕获 pay.html URL（含完整订单信息）。
+# 用户在自己的浏览器中打开 pay.html 后，页面会调用 prepayOrder
+# 并跳转到对应支付页面。这样能保证 Referer 来自商户域名，
+# 解决微信 H5 支付的 Referer 校验问题。
 _PAY_URL_INTERCEPT_RE = re.compile(
-    r"mclient\.alipay\.com/h5pay"
+    r"/e-pay/pay\.html\?"
+    r"|mclient\.alipay\.com/h5pay"
     r"|wx\.tenpay\.com"
     r"|pay\.weixin\.qq\.com",
     re.IGNORECASE,
@@ -397,6 +401,9 @@ class RechargeSession:
         except Exception:
             raise RuntimeError("支付网关页面未正常加载")
 
+        # 等待 SPA 数据加载完成（trade API 等），否则按钮点击无效
+        await page.wait_for_load_state("networkidle", timeout=15000)
+
         # 点击"立即支付"，等待 payways 支付方式选择页
         await pay_btn.tap()
 
@@ -421,10 +428,11 @@ class RechargeSession:
         return methods
 
     async def select_payment(self, method_index: int) -> str:
-        """点击支付方式，拦截支付链接并返回。
+        """点击支付方式，拦截支付页面 URL 并返回。
 
-        拦截到 alipay / wx.tenpay 的请求时立即 abort，
-        只捕获 URL 不让无头浏览器访问，确保支付链接未被消费。
+        优先拦截 pay.html（含订单信息），用户在自己的浏览器中
+        打开后会自动跳转到对应支付页面，保证 Referer 正确。
+        回退模式：拦截 alipay / wx.tenpay 的直接 URL。
         """
         page = self._page
         loop = asyncio.get_running_loop()

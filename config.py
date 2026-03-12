@@ -18,18 +18,11 @@ import yaml
 from loguru import logger
 
 _DEFAULTS = {
-    "check_interval": 3600,
-    "thresholds": {
-        "electricity": 5.0,
-        "cold_water": 1.0,
-        "hot_water": 0.5,
-    },
     "telegram": {
         "bot_token": "",
-        "chat_id": "",
         "api_base": "",
+        "proxy": "",
     },
-    "field_mapping": {},
 }
 
 
@@ -50,14 +43,9 @@ def load_config(path: str = "config.yaml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
         user_cfg = yaml.safe_load(f) or {}
 
-    url = user_cfg.get("url", "")
-    if not url or "YOUR_PARAMS_HERE" in url:
-        raise ValueError("请先在 config.yaml 中填写正确的 url 链接")
-
     cfg = _deep_merge(_DEFAULTS, user_cfg)
 
-    tg = cfg.get("telegram", {})
-    if not tg.get("bot_token") or not tg.get("chat_id"):
-        logger.warning("Telegram bot_token 或 chat_id 未配置，余额不足时将只打印日志而不发送通知")
+    if not cfg.get("telegram", {}).get("bot_token"):
+        raise ValueError("请在 config.yaml 中填写 telegram.bot_token")
 
     return cfg

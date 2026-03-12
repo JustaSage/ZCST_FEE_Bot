@@ -4,40 +4,20 @@
 # 复制本文件为 config.yaml 并填入真实信息：
 #   cp config.yaml.example config.yaml
 
-# 查询链接（粘贴你的完整 17wanxiao 链接）
-url: "https://xqh5.17wanxiao.com/userwaterelecmini/index.html#/?params=YOUR_PARAMS_HERE"
-
-# 检查间隔（秒），默认 3600 = 1小时
-check_interval: 3600
-
-# 余额预警阈值（电费单位：kWh；冷热水单位：吨）
-thresholds:
-  electricity: 5.0    # 电费低于此 kWh 数时提醒
-  cold_water: 1.0     # 冷水费低于此吨数时提醒
-  hot_water: 0.5      # 热水费低于此吨数时提醒
-
 # =============================================
-# Telegram Bot 通知配置
+# Telegram Bot 配置（必填）
 # =============================================
-# 1. 在 Telegram 搜索 @BotFather 创建 Bot，获取 bot_token
-# 2. 向你的 Bot 发送一条消息，然后访问
-#    https://api.telegram.org/bot<TOKEN>/getUpdates 获取 chat_id
+# 在 Telegram 搜索 @BotFather 创建 Bot，获取 bot_token
 telegram:
   bot_token: "YOUR_BOT_TOKEN"
-  chat_id: "YOUR_CHAT_ID"
   # api_base: ""   # 可选：自定义 API 地址（反代），留空则使用官方 api.telegram.org
   # proxy: "http://127.0.0.1:7890"  # 可选：本地代理地址，无代理则注释掉
 
 # =============================================
-# 字段映射（可选，当自动识别失败时使用）
+# 以下设置每位用户通过 Telegram 命令独立配置
 # =============================================
-# 运行 python main.py --debug 查看原始 API 数据后按需填写
-# field_mapping:
-#   electricity:
-#     key: "elecBalance"           # 直接按字段名匹配
-#   cold_water:
-#     name: "冷水费"               # 按条目名称匹配
-#     balance_key: "balance"       # 余额字段名
-#   hot_water:
-#     name: "热水费"
-#     balance_key: "balance"
+# /seturl <链接>                    — 设置 17wanxiao 查询链接
+# /setthreshold <类型> <数值>       — 设置余额预警阈值
+# /setinterval <秒数>               — 设置定时刷新间隔（默认 300 秒）
+# /settings                         — 查看当前配置
+# /resetme confirm                  — 清除所有数据
