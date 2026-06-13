@@ -14,14 +14,17 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 bot.py
-交互式 Telegram Bot —— 多用户余额查询 + 分步充值 + 交互式设置 + 定时预警。
+交互式 Telegram Bot —— 多用户余额查询 + 交互式设置 + 定时预警。
 首次使用自动引导配置，所有设置通过 /settings 交互完成，数据完全隔离。
 """
 import asyncio
+import os
+import re
 from datetime import datetime
+from pathlib import Path
 
 from loguru import logger
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -33,15 +36,16 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from fetcher import RechargeSession, fetch_balances_async
+from fetcher import fetch_balances_async, fetch_index_data_async
+from payment import create_alipay_url, convert_to_alipay_scheme_url, convert_to_cashier_url
 from sso import sso_fetch_fee_url
 from store import UserStore
 
 # ── 会话状态 ─────────────────────────────────────────────────────────────────
-(CHOOSE_TYPE, CHOOSE_AMOUNT, CHOOSE_PAYMENT,
- SETTINGS_MENU, AWAITING_INPUT,
+(SETTINGS_MENU, AWAITING_INPUT,
  SETUP_URL, SETUP_THRESHOLD, SETUP_INTERVAL,
- SSO_USERNAME, SSO_PASSWORD) = range(10)
+ SSO_USERNAME, SSO_PASSWORD,
+ CHARGE_FEE_TYPE, CHARGE_AMOUNT, CHARGE_CUSTOM_AMOUNT) = range(10)
 
 # ── 常量 ─────────────────────────────────────────────────────────────────────
 _LABELS = {
@@ -50,14 +54,15 @@ _LABELS = {
     "hot_water":   ("♨️ 热水", "吨"),
 }
 
-_FEE_TYPES = [
-    ("electricity", "⚡ 电费"),
-    ("cold_water",  "🚰 冷水"),
-    ("hot_water",   "♨️ 热水"),
-]
-
 # 引导设置时阈值的顺序
 _THRESHOLD_STEPS = ["electricity", "cold_water", "hot_water"]
+
+# 充值可选固定金额（元）
+_CHARGE_AMOUNTS = [10, 20, 30, 50, 100]
+
+# 充值后到账监控：每 15 秒查一次，最多 20 次（5 分钟）
+_CHARGE_POLL_INTERVAL = 15
+_CHARGE_POLL_MAX_ATTEMPTS = 20
 
 # ── 模块级状态（由 create_bot 初始化） ────────────────────────────────────────
 _bot_cfg: dict = {}
@@ -65,7 +70,6 @@ _store: UserStore | None = None
 
 _user_caches: dict[str, dict] = {}   # uid → {"balances": {...}, "time": datetime}
 _user_locks: dict[str, asyncio.Lock] = {}
-_browser_sem: asyncio.Semaphore | None = None   # 限制并发浏览器实例
 
 
 # ── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -103,8 +107,7 @@ async def _refresh_user_cache(uid: str) -> dict:
         return {}
     lock = _get_lock(uid)
     async with lock:
-        async with _browser_sem:
-            balances = await fetch_balances_async(url)
+        balances = await fetch_balances_async(url)
         if balances:
             _user_caches[uid] = {"balances": balances, "time": datetime.now()}
         cache = _user_caches.get(uid, {})
@@ -134,12 +137,6 @@ def _format_balance_msg(uid: str) -> str:
     return "\n".join(lines)
 
 
-async def _cleanup_session(context: ContextTypes.DEFAULT_TYPE):
-    session: RechargeSession | None = context.user_data.pop("session", None)
-    if session:
-        await session.close()
-
-
 def _schedule_user_job(app: Application, uid: str, interval: int):
     job_name = f"refresh_{uid}"
     for job in app.job_queue.get_jobs_by_name(job_name):
@@ -163,8 +160,7 @@ async def _verify_url_and_cache(uid: str, url: str) -> dict:
     """用给定 URL 拉取余额，成功则更新缓存并返回余额，失败返回空 dict。"""
     lock = _get_lock(uid)
     async with lock:
-        async with _browser_sem:
-            balances = await fetch_balances_async(url)
+        balances = await fetch_balances_async(url)
         if balances:
             _user_caches[uid] = {"balances": balances, "time": datetime.now()}
         return balances or {}
@@ -715,297 +711,275 @@ async def on_awaiting_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /charge 会话 ─────────────────────────────────────────────────────────────
 
-async def charge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/charge：交互式选择充值类型与金额，纯 API 生成支付宝支付链接。"""
     if not await _require_url(update):
         return ConversationHandler.END
 
     uid = _uid(update)
-    url = _user_url(uid)
-    await _cleanup_session(context)
+    msg = await update.message.reply_text("⏳ 正在获取最新余额…")
 
-    msg = await update.message.reply_text("⏳ 正在加载页面，请稍候…")
-
-    session = RechargeSession()
     try:
-        balances = await session.start(url)
+        balances = await _refresh_user_cache(uid)
     except Exception as e:
-        await msg.edit_text(f"❌ 页面加载失败：{e}")
-        await session.close()
+        await msg.edit_text(f"❌ 刷新余额失败：{e}")
         return ConversationHandler.END
 
-    _update_user_cache(uid, balances)
-    context.user_data["session"] = session
+    if not balances:
+        await msg.edit_text("❌ 未能获取余额数据，请检查链接是否过期。")
+        return ConversationHandler.END
 
     lines = ["📊 当前余额：\n"]
     for key, (label, unit) in _LABELS.items():
         if key in balances:
             lines.append(f"  {label}：{balances[key]:.2f} {unit}")
-    lines.append("\n请选择充值类型：")
+    lines.append("\n请选择要充值的类型：")
 
     keyboard = [
-        [InlineKeyboardButton(label, callback_data=f"type_{key}")]
-        for key, label in _FEE_TYPES
+        [InlineKeyboardButton(label, callback_data=f"charge_type:{key}")]
+        for key, (label, _) in _LABELS.items()
     ]
-    keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
 
     await msg.edit_text(
         "\n".join(lines),
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
-    return CHOOSE_TYPE
+    return CHARGE_FEE_TYPE
 
 
-async def on_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_charge_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """用户选择充值类型后，展示金额选项。"""
     query = update.callback_query
     await query.answer()
 
-    if query.data == "cancel":
-        await _cleanup_session(context)
-        await query.edit_message_text("已取消充值。")
-        return ConversationHandler.END
-
-    fee_type = query.data.removeprefix("type_")
-    session: RechargeSession | None = context.user_data.get("session")
-    if not session:
-        await query.edit_message_text("❌ 会话已过期，请重新 /charge")
-        return ConversationHandler.END
-
-    context.user_data["fee_type"] = fee_type
-    await query.edit_message_text("⏳ 正在获取充值档位…")
-
-    try:
-        amounts = await session.get_amounts(fee_type)
-    except Exception as e:
-        await query.edit_message_text(f"❌ 获取档位失败：{e}")
-        await _cleanup_session(context)
-        return ConversationHandler.END
-
-    if not amounts:
-        await query.edit_message_text("❌ 未找到可用充值档位。")
-        await _cleanup_session(context)
-        return ConversationHandler.END
-
-    context.user_data["amounts"] = amounts
-
-    keyboard = [
-        [InlineKeyboardButton(a["text"], callback_data=f"amount_{a['index']}")]
-        for a in amounts
-    ]
-    keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
-
-    await query.edit_message_text(
-        "请选择充值档位：",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return CHOOSE_AMOUNT
-
-
-async def on_choose_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "cancel":
-        await _cleanup_session(context)
-        await query.edit_message_text("已取消充值。")
-        return ConversationHandler.END
-
-    amount_index = int(query.data.removeprefix("amount_"))
-    session: RechargeSession | None = context.user_data.get("session")
-    if not session:
-        await query.edit_message_text("❌ 会话已过期，请重新 /charge")
-        return ConversationHandler.END
-
-    await query.edit_message_text("⏳ 正在提交订单，请稍候…")
-
-    try:
-        methods = await session.confirm_and_get_pay_methods(amount_index)
-    except Exception as e:
-        await query.edit_message_text(f"❌ 提交订单失败：{e}")
-        await _cleanup_session(context)
-        return ConversationHandler.END
-
-    if not methods:
-        await query.edit_message_text("❌ 未找到可用支付方式。")
-        await _cleanup_session(context)
-        return ConversationHandler.END
-
-    context.user_data["methods"] = methods
-
-    _icons = {"支付宝": "💳", "微信": "💚"}
-    keyboard = []
-    for m in methods:
-        icon = next((v for k, v in _icons.items() if k in m["name"]), "💳")
-        keyboard.append(
-            [InlineKeyboardButton(f"{icon} {m['name']}", callback_data=f"pay_{m['index']}")]
-        )
-    keyboard.append([InlineKeyboardButton("❌ 取消", callback_data="cancel")])
-
-    await query.edit_message_text(
-        "请选择支付方式：",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return CHOOSE_PAYMENT
-
-
-async def on_choose_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data == "cancel":
-        await _cleanup_session(context)
-        await query.edit_message_text("已取消充值。")
-        return ConversationHandler.END
-
-    method_index = int(query.data.removeprefix("pay_"))
-    session: RechargeSession | None = context.user_data.get("session")
-    if not session:
-        await query.edit_message_text("❌ 会话已过期，请重新 /charge")
-        return ConversationHandler.END
-
-    await query.edit_message_text("⏳ 正在生成支付链接…")
-
-    try:
-        pay_url = await session.select_payment(method_index)
-    except Exception as e:
-        await query.edit_message_text(f"❌ 获取支付链接失败：{e}")
-        await _cleanup_session(context)
-        return ConversationHandler.END
-
-    await _cleanup_session(context)
-
-    # 记录充值前的余额快照
-    fee_type = context.user_data.get("fee_type", "")
     uid = str(query.from_user.id)
-    old_balances = _user_caches.get(uid, {}).get("balances", {})
-    old_val = old_balances.get(fee_type)
+    fee_type = query.data.split(":", 1)[1]
+    context.user_data["charge_fee_type"] = fee_type
 
-    keyboard = [
-        [InlineKeyboardButton("💰 去支付", url=pay_url)],
-        [InlineKeyboardButton("❌ 取消监控", callback_data="cancel_charge_monitor")],
+    url = _user_url(uid)
+    msg = await query.edit_message_text("⏳ 正在读取价格信息…")
+
+    try:
+        _login, index_data = await fetch_index_data_async(url)
+    except Exception as e:
+        await msg.edit_text(f"❌ 读取宿舍信息失败：{e}\n\n请重试 /charge")
+        context.user_data.pop("charge_fee_type", None)
+        return ConversationHandler.END
+
+    txcode = {"electricity": "51101", "cold_water": "51201", "hot_water": "51301"}[fee_type]
+    mod = None
+    for item in index_data.get("modlist") or []:
+        if str(item.get("accode")) == txcode or str(item.get("ecardacccode")) == txcode:
+            mod = item
+            break
+
+    if mod is None:
+        await msg.edit_text("❌ 未找到该类型的充值设备信息。")
+        context.user_data.pop("charge_fee_type", None)
+        return ConversationHandler.END
+
+    price = float(mod.get("price") or 0)
+    context.user_data["charge_price"] = price
+
+    label, unit = _LABELS[fee_type]
+    lines = [
+        f"*已选择：{label}*",
+        f"单价：`{price:.3f}` 元/{unit}\n",
+        "请选择充值金额：",
     ]
-    monitor_text = (
-        "✅ 支付链接已生成！\n\n"
-        "请在手机浏览器中打开下方链接完成支付\n"
-        "（勿在微信内打开）\n\n"
-        "🔍 正在监控余额变化，支付完成后会自动通知…"
-    )
-    pay_msg = await query.edit_message_text(
-        monitor_text,
+
+    keyboard = []
+    for amt in _CHARGE_AMOUNTS:
+        est = amt / price if price else 0
+        keyboard.append([
+            InlineKeyboardButton(
+                f"¥{amt}（约 {est:.2f} {unit}）",
+                callback_data=f"charge_amt:{amt * 100}",
+            )
+        ])
+    keyboard.append([
+        InlineKeyboardButton("✏️ 其他金额", callback_data="charge_custom"),
+        InlineKeyboardButton("❌ 取消", callback_data="charge_cancel"),
+    ])
+
+    await msg.edit_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
+    return CHARGE_AMOUNT
 
-    # 启动充值监控（后台 task，避免 job_queue 跳过问题）
-    if old_val is not None and _user_url(uid):
-        _start_charge_monitor(
-            context.application, uid, fee_type, old_val,
-            pay_msg.chat_id, pay_msg.message_id, pay_url,
+
+async def on_charge_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """用户选择固定金额或点击自定义/取消。"""
+    query = update.callback_query
+    await query.answer()
+
+    uid = str(query.from_user.id)
+    data = query.data
+
+    if data == "charge_cancel":
+        context.user_data.pop("charge_fee_type", None)
+        context.user_data.pop("charge_price", None)
+        await query.edit_message_text("✅ 已取消充值。")
+        return ConversationHandler.END
+
+    if data == "charge_custom":
+        await query.edit_message_text(
+            "✏️ 请发送充值金额（元）：\n\n"
+            "例如：`10`\n\n"
+            "发送 /cancel 取消。",
+            parse_mode="Markdown",
         )
+        return CHARGE_CUSTOM_AMOUNT
 
+    if not data.startswith("charge_amt:"):
+        return CHARGE_AMOUNT
+
+    cents = int(data.split(":", 1)[1])
+    amount_yuan = cents / 100
+    await _process_charge(query, context, uid, amount_yuan)
     return ConversationHandler.END
 
 
-# ── 充值监控 ───────────────────────────────────────────────────────────────
-
-# uid → asyncio.Task，后台轮询任务
-_charge_monitor_tasks: dict[str, asyncio.Task] = {}
-
-
-def _start_charge_monitor(
-    app: Application, uid: str, fee_type: str, old_val: float,
-    chat_id: int, message_id: int, pay_url: str,
-):
-    """"启动后台 asyncio.Task 轮询余额。"""
-    _stop_charge_monitor(app, uid)
-    task = asyncio.create_task(
-        _charge_monitor_loop(app, uid, fee_type, old_val, chat_id, message_id, pay_url)
-    )
-    _charge_monitor_tasks[uid] = task
-
-
-async def _charge_monitor_loop(
-    app: Application, uid: str, fee_type: str, old_val: float,
-    chat_id: int, message_id: int, pay_url: str,
-):
-    """每 5 秒检测余额变化，发现增加则编辑支付消息为到账通知。"""
-    label, unit = _LABELS.get(fee_type, ("", ""))
-    max_attempts = 40
+async def on_charge_custom_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """用户发送自定义充值金额。"""
+    uid = _uid(update)
+    text = update.message.text.strip()
 
     try:
-        for attempt in range(max_attempts):
-            await asyncio.sleep(5)
+        amount_yuan = float(text)
+    except ValueError:
+        await update.message.reply_text("❌ 请输入有效的数字，例如 `10`：")
+        return CHARGE_CUSTOM_AMOUNT
 
-            # 检查是否已被取消
-            if uid not in _charge_monitor_tasks:
-                return
+    if amount_yuan <= 0:
+        await update.message.reply_text("❌ 充值金额必须大于 0：")
+        return CHARGE_CUSTOM_AMOUNT
 
-            url = _user_url(uid)
-            if not url:
-                return
-
-            try:
-                async with _browser_sem:
-                    balances = await fetch_balances_async(url)
-            except Exception:
-                continue
-
-            if not balances:
-                continue
-
-            new_val = balances.get(fee_type)
-            if new_val is None:
-                continue
-
-            _user_caches[uid] = {"balances": balances, "time": datetime.now()}
-
-            if new_val > old_val:
-                diff = new_val - old_val
-                try:
-                    await app.bot.edit_message_text(
-                        f"🎉 *充值到账！*\n\n"
-                        f"{label}：`{old_val:.2f}` → `{new_val:.2f}` {unit}\n"
-                        f"变化：+{diff:.2f} {unit}",
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    logger.error(f"编辑充值消息失败：{e}")
-                return
-
-        # 超时
-        try:
-            keyboard = [[InlineKeyboardButton("💰 去支付", url=pay_url)]]
-            await app.bot.edit_message_text(
-                f"✅ 支付链接已生成！\n\n"
-                f"请在手机浏览器中打开下方链接完成支付\n"
-                f"（勿在微信内打开）\n\n"
-                f"⏰ 余额监控已超时，发送 /update 查看最新余额。",
-                chat_id=chat_id,
-                message_id=message_id,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-        except Exception:
-            pass
-    except asyncio.CancelledError:
-        pass
-    finally:
-        _charge_monitor_tasks.pop(uid, None)
+    await _process_charge(update.message, context, uid, amount_yuan)
+    return ConversationHandler.END
 
 
-def _stop_charge_monitor(app: Application, uid: str):
-    """停止指定用户的充值监控任务。"""
-    task = _charge_monitor_tasks.pop(uid, None)
-    if task and not task.done():
-        task.cancel()
+async def _process_charge(
+    update_or_query: Update | CallbackQuery,
+    context: ContextTypes.DEFAULT_TYPE,
+    uid: str,
+    amount_yuan: float,
+):
+    """调用 payment 模块生成支付宝 WAP 支付链接，包装成支付宝 App 可直接点开的链接后发送给用户，并安排到账监控。"""
+    url = _user_url(uid)
+    fee_type = context.user_data.get("charge_fee_type")
+    if not fee_type:
+        if isinstance(update_or_query, CallbackQuery):
+            await update_or_query.edit_message_text("❌ 会话已过期，请重新使用 /charge")
+        return
+
+    label, unit = _LABELS[fee_type]
+
+    if isinstance(update_or_query, CallbackQuery):
+        msg = await update_or_query.edit_message_text(
+            f"⏳ 正在为 {label} 生成 ¥{amount_yuan:.2f} 的支付链接…"
+        )
+    else:
+        msg = await update_or_query.reply_text(
+            f"⏳ 正在为 {label} 生成 ¥{amount_yuan:.2f} 的支付链接…"
+        )
+
+    # ── 生成 17wanxiao 支付宝 WAP 链接 ────────────────────────────────────
+    try:
+        result = await create_alipay_url(url, fee_type, amount_yuan)
+    except Exception as e:
+        logger.error(f"为用户 {uid} 生成支付链接失败：{e}")
+        await msg.edit_text(f"❌ 生成支付链接失败：{e}\n\n请稍后重试 /charge")
+        context.user_data.pop("charge_fee_type", None)
+        context.user_data.pop("charge_price", None)
+        return
+
+    # ── 先拿到 mclient.alipay.com 收银台链接，再包装成 App scheme 链接 ───────
+    try:
+        cashier_url = await convert_to_cashier_url(result["alipay_url"])
+        pay_url = convert_to_alipay_scheme_url(cashier_url)
+    except Exception as e:
+        logger.warning(f"用户 {uid} 转换支付宝收银台/scheme 链接失败，使用原始链接：{e}")
+        pay_url = result["alipay_url"]
+
+    pre_balance = _user_caches.get(uid, {}).get("balances", {}).get(fee_type, 0)
+
+    # 安排到账监控
+    job_name = f"charge_{uid}_{result['orderno']}"
+    context.application.job_queue.run_repeating(
+        _monitor_charge,
+        interval=_CHARGE_POLL_INTERVAL,
+        first=_CHARGE_POLL_INTERVAL,
+        name=job_name,
+        data={
+            "uid": uid,
+            "url": url,
+            "fee_type": fee_type,
+            "pre_balance": pre_balance,
+            "amount_yuan": amount_yuan,
+            "orderno": result["orderno"],
+            "attempts": 0,
+        },
+    )
+
+    # ── 5. 把支付链接发给用户 ─────────────────────────────────────────────────
+    await msg.edit_text(
+        f"✅ *支付链接已生成*\n\n"
+        f"{label}：¥{amount_yuan:.2f}\n"
+        f"订单号：`{result['orderno']}`\n\n"
+        f"点击下方按钮前往 *支付宝* 完成支付。支付完成后约 1–5 分钟到账。",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 去支付宝支付", url=pay_url)]
+        ]),
+    )
+
+    context.user_data.pop("charge_fee_type", None)
+    context.user_data.pop("charge_price", None)
 
 
-async def _on_cancel_charge_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """用户点击“取消监控”按钮。"""
-    query = update.callback_query
-    await query.answer()
-    uid = str(query.from_user.id)
-    _stop_charge_monitor(context.application, uid)
-    await query.edit_message_text("✅ 充值监控已取消。")
+async def _monitor_charge(context: ContextTypes.DEFAULT_TYPE):
+    """轮询余额，检测充值是否到账。"""
+    data = context.job.data
+    data["attempts"] += 1
+    uid = data["uid"]
+    fee_type = data["fee_type"]
+    pre_balance = data["pre_balance"]
+
+    if data["attempts"] > _CHARGE_POLL_MAX_ATTEMPTS:
+        await context.bot.send_message(
+            chat_id=int(uid),
+            text="⏰ 充值到账监控已超时。如已支付，通常几分钟后到账，请使用 /balance 查询。",
+        )
+        context.job.schedule_removal()
+        return
+
+    try:
+        balances = await fetch_balances_async(data["url"])
+    except Exception as e:
+        logger.warning(f"充值监控查询余额失败（{uid}/{fee_type}）：{e}")
+        return
+
+    _update_user_cache(uid, balances)
+    new_balance = balances.get(fee_type)
+    if new_balance is None:
+        return
+
+    if new_balance > pre_balance + 0.001:
+        label, unit = _LABELS[fee_type]
+        await context.bot.send_message(
+            chat_id=int(uid),
+            text=(
+                f"🎉 *充值到账！*\n\n"
+                f"{label}：`{pre_balance:.2f}` → `{new_balance:.2f}` {unit}\n"
+                f"增加：`{new_balance - pre_balance:.2f}` {unit}"
+            ),
+            parse_mode="Markdown",
+        )
+        context.job.schedule_removal()
 
 
 # ── SSO 登录流程 ─────────────────────────────────────────────────────────────
@@ -1138,26 +1112,18 @@ async def on_sso_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /cancel 全局取消 ─────────────────────────────────────────────────────────
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _cleanup_session(context)
     context.user_data.pop("setting_key", None)
     context.user_data.pop("setup_threshold_idx", None)
     context.user_data.pop("sso_username", None)
     context.user_data.pop("sso_origin", None)
-    # 停止充值监控
-    uid = _uid(update)
-    _stop_charge_monitor(context.application, uid)
+    context.user_data.pop("charge_fee_type", None)
+    context.user_data.pop("charge_price", None)
     await update.message.reply_text("✅ 已取消当前操作。")
     return ConversationHandler.END
 
 
 async def cmd_cancel_idle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = _uid(update)
-    # 即使不在会话中，也要能停止充值监控
-    if uid in _charge_monitor_tasks:
-        _stop_charge_monitor(context.application, uid)
-        await update.message.reply_text("✅ 充值监控已停止。")
-    else:
-        await update.message.reply_text("ℹ️ 当前没有进行中的操作。")
+    await update.message.reply_text("ℹ️ 当前没有进行中的操作。")
 
 
 async def on_unexpected_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1240,14 +1206,18 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ── 构建应用 ─────────────────────────────────────────────────────────────────
 
 def create_bot(config: dict) -> Application:
-    global _bot_cfg, _store, _browser_sem
+    global _bot_cfg, _store
     _bot_cfg = config
     _store = UserStore()
-    _browser_sem = asyncio.Semaphore(2)  # 最多同时 2 个浏览器实例
 
     tg = config["telegram"]
     token = tg["bot_token"]
-    proxy = tg.get("proxy", "").strip() or None
+    proxy = (
+        tg.get("proxy", "").strip()
+        or os.getenv("HTTPS_PROXY", "").strip()
+        or os.getenv("HTTP_PROXY", "").strip()
+        or None
+    )
     request = HTTPXRequest(
         connect_timeout=30.0,
         read_timeout=30.0,
@@ -1276,14 +1246,11 @@ def create_bot(config: dict) -> Application:
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", cmd_start),
-            CommandHandler("charge", charge_start),
             CommandHandler("settings", settings_start),
             CommandHandler("link", cmd_link),
+            CommandHandler("charge", cmd_charge),
         ],
         states={
-            CHOOSE_TYPE:     [CallbackQueryHandler(on_choose_type)],
-            CHOOSE_AMOUNT:   [CallbackQueryHandler(on_choose_amount)],
-            CHOOSE_PAYMENT:  [CallbackQueryHandler(on_choose_payment)],
             SETTINGS_MENU:   [CallbackQueryHandler(on_settings_menu)],
             AWAITING_INPUT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, on_awaiting_input)],
             SETUP_URL: [
@@ -1300,6 +1267,9 @@ def create_bot(config: dict) -> Application:
                 CallbackQueryHandler(on_skip_interval, pattern="^setup_skip_interval$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, on_setup_interval),
             ],
+            CHARGE_FEE_TYPE: [CallbackQueryHandler(on_charge_type, pattern=r"^charge_type:")],
+            CHARGE_AMOUNT:   [CallbackQueryHandler(on_charge_amount, pattern=r"^charge_")],
+            CHARGE_CUSTOM_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, on_charge_custom_amount)],
         },
         fallbacks=[
             CommandHandler("cancel", cmd_cancel),
@@ -1312,7 +1282,6 @@ def create_bot(config: dict) -> Application:
 
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("update", cmd_update))
-    app.add_handler(CallbackQueryHandler(_on_cancel_charge_monitor, pattern="^cancel_charge_monitor$"))
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cmd_cancel_idle))
     app.add_error_handler(_error_handler)

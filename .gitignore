@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 .venv/
+.venv-*/
 venv/
 env/
 
@@ -17,11 +18,15 @@ config.yaml
 users.json
 users.json.tmp
 
-# Playwright 浏览器缓存
-.playwright/
-
 # 调试产物
 _debug_*.png
+_*.py
+_*.json
+_*.html
+_*.js
+_*.png
+_*.har
+_*.txt
 
 # 旧项目目录（已合入 sso.py）
 ZCST_FEE/
