@@ -38,7 +38,7 @@ _UA = (
 def _client() -> httpx.AsyncClient:
     """构造复用的异步 HTTP 客户端。"""
     return httpx.AsyncClient(
-        verify=False,
+        verify=True,
         timeout=httpx.Timeout(60.0, connect=30.0),
         headers={
             "User-Agent": _UA,

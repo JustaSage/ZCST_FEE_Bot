@@ -88,6 +88,8 @@ Bot 启动后，用户发送 `/start` 即可开始使用。
 3. 再包装成 `alipays://platformapi/startapp` → `https://ds.alipay.com/?scheme=...`，点击后唤起支付宝 App；
 4. 发送支付按钮，支付完成后自动轮询余额，到账后推送 Telegram 通知。
 
+> 💡 `/charge` 会直接使用本地缓存的余额，无需先刷新，加快进入充值流程。发送 `/balance` 或 `/update` 可刷新余额。
+
 支持的类型：电费、冷水、热水。
 
 ### 完整命令列表
@@ -119,6 +121,7 @@ python main.py --debug --url <链接>   # 调试模式，打印 API 请求与响
 ├── sso.py           # SSO 统一认证（CAS REST API），自动获取查询链接
 ├── config.py        # 配置文件加载（仅 Bot 连接配置）
 ├── store.py         # 多用户数据持久化（JSON 存储）
+├── utils.py         # 通用工具：日志脱敏等
 ├── config.yaml.example  # 配置模板
 ├── pyproject.toml   # 项目元数据与依赖
 └── requirements.txt # pip 依赖列表
@@ -133,6 +136,15 @@ python main.py --debug --url <链接>   # 调试模式，打印 API 请求与响
 5. **自动充值** — `/charge` 选择类型与金额后，依次调用 `goPay` → `getPayInfoByUuid` → `callWapCashDeskData` → `prepayOrder`，拿到支付宝 WAP 支付链接；再 POST 到 `openapi.alipay.com/gateway.do` 捕获 302 重定向，得到 `mclient.alipay.com/cashier/mobilepay.htm` 收银台链接；最后包装成 `alipays://platformapi/startapp` → `https://ds.alipay.com/?scheme=...`，方便在支付宝 App 内打开
 6. **到账监控** — 支付完成后后台轮询余额，检测到对应类型余额增加即推送 Telegram 到账通知
 7. **定时预警** — 后台按用户设定的间隔轮询余额，低于阈值时通过 Telegram 推送通知
+
+## 🔒 安全说明
+
+- **SSO 登录**：`sso.py` 已启用 SSL 证书验证（`verify=True`），防止中间人攻击。如果学校证书不被系统信任，请更新 CA 证书或配置 `REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE`，而不是关闭验证。
+- **敏感数据**：
+  - `config.yaml` 包含 Telegram Bot Token，已加入 `.gitignore`，请勿提交到仓库。
+  - `users.json` 包含查询链接等敏感信息，已加入 `.gitignore`，建议设置文件权限为仅所有者可读写（如 `chmod 600`）。
+- **日志脱敏**：日志中对 URL 的 `params`、`ticket`、`sign`、`token` 等敏感参数会自动掩码，避免凭证泄露。
+- **SSO 密码**：Bot 收到密码后会立即删除该 Telegram 消息，密码不会被持久化存储。
 
 ## 📄 License
 

@@ -40,6 +40,7 @@ from fetcher import fetch_balances_async, fetch_index_data_async
 from payment import create_alipay_url, convert_to_alipay_scheme_url, convert_to_cashier_url
 from sso import sso_fetch_fee_url
 from store import UserStore
+from utils import sanitize_for_log
 
 # ── 会话状态 ─────────────────────────────────────────────────────────────────
 (SETTINGS_MENU, AWAITING_INPUT,
@@ -717,22 +718,18 @@ async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     uid = _uid(update)
-    msg = await update.message.reply_text("⏳ 正在获取最新余额…")
 
-    try:
-        balances = await _refresh_user_cache(uid)
-    except Exception as e:
-        await msg.edit_text(f"❌ 刷新余额失败：{e}")
-        return ConversationHandler.END
-
-    if not balances:
-        await msg.edit_text("❌ 未能获取余额数据，请检查链接是否过期。")
-        return ConversationHandler.END
+    # 优先使用缓存余额，避免每次 /charge 都发起一次完整 API 请求
+    cache = _user_caches.get(uid, {})
+    balances = cache.get("balances", {})
 
     lines = ["📊 当前余额：\n"]
-    for key, (label, unit) in _LABELS.items():
-        if key in balances:
-            lines.append(f"  {label}：{balances[key]:.2f} {unit}")
+    if balances:
+        for key, (label, unit) in _LABELS.items():
+            if key in balances:
+                lines.append(f"  {label}：`{balances[key]:.2f}` {unit}")
+    else:
+        lines.append("  （暂无缓存，发送 /balance 可刷新余额）")
     lines.append("\n请选择要充值的类型：")
 
     keyboard = [
@@ -740,7 +737,7 @@ async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key, (label, _) in _LABELS.items()
     ]
 
-    await msg.edit_text(
+    await update.message.reply_text(
         "\n".join(lines),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -891,8 +888,8 @@ async def _process_charge(
     try:
         result = await create_alipay_url(url, fee_type, amount_yuan)
     except Exception as e:
-        logger.error(f"为用户 {uid} 生成支付链接失败：{e}")
-        await msg.edit_text(f"❌ 生成支付链接失败：{e}\n\n请稍后重试 /charge")
+        logger.error(f"为用户 {uid} 生成支付链接失败：{sanitize_for_log(str(e))}")
+        await msg.edit_text(f"❌ 生成支付链接失败，请稍后重试 /charge")
         context.user_data.pop("charge_fee_type", None)
         context.user_data.pop("charge_price", None)
         return
@@ -960,7 +957,7 @@ async def _monitor_charge(context: ContextTypes.DEFAULT_TYPE):
     try:
         balances = await fetch_balances_async(data["url"])
     except Exception as e:
-        logger.warning(f"充值监控查询余额失败（{uid}/{fee_type}）：{e}")
+        logger.warning(f"充值监控查询余额失败（{uid}/{fee_type}）：{sanitize_for_log(str(e))}")
         return
 
     _update_user_cache(uid, balances)
@@ -1021,7 +1018,8 @@ async def on_sso_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         url = await sso_fetch_fee_url(username, password)
     except Exception as e:
-        await msg.edit_text(f"❌ SSO 登录失败：{e}")
+        logger.warning(f"用户 {uid} SSO 登录失败：{sanitize_for_log(str(e))}")
+        await msg.edit_text(f"❌ SSO 登录失败，请检查账号密码后重试")
         if origin == "setup":
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔑 重试 SSO 登录", callback_data="setup_sso")],
@@ -1165,7 +1163,7 @@ async def _scheduled_user_refresh(context: ContextTypes.DEFAULT_TYPE):
     try:
         await _refresh_user_cache(uid)
     except Exception as e:
-        logger.error(f"定时刷新用户 {uid} 失败：{e}")
+        logger.error(f"定时刷新用户 {uid} 失败：{sanitize_for_log(str(e))}")
         return
 
     cache = _user_caches.get(uid, {})
@@ -1200,7 +1198,7 @@ async def _scheduled_user_refresh(context: ContextTypes.DEFAULT_TYPE):
 # ── 全局错误处理 ─────────────────────────────────────────────────────────
 
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Exception while handling an update: {context.error}")
+    logger.error(f"Exception while handling an update: {sanitize_for_log(str(context.error))}")
 
 
 # ── 构建应用 ─────────────────────────────────────────────────────────────────

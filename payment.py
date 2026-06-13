@@ -27,6 +27,7 @@ import httpx
 from loguru import logger
 
 from fetcher import _client, _extract_raw_params, _login_check, _service_api
+from utils import sanitize_url, sanitize_for_log
 
 # ── 支付网关常量 ──────────────────────────────────────────────────────────────
 _PAY_BASE = "https://xqh5.17wanxiao.com/smartWaterAndElectricityService"
@@ -390,6 +391,6 @@ async def convert_to_cashier_url(alipay_url: str) -> str:
             if "mclient.alipay.com" in final:
                 return final
     except Exception as e:
-        logger.warning(f"转换 cashier 链接失败：{e}")
+        logger.warning(f"转换 cashier 链接失败：{sanitize_for_log(str(e))}")
 
     return alipay_url

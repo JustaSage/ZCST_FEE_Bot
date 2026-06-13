@@ -30,6 +30,8 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from loguru import logger
 
+from utils import sanitize_url
+
 # ── 17wanxiao API 常量 ───────────────────────────────────────────────────────
 _API_BASE = "https://xqh5.17wanxiao.com/smartWaterAndElectricityService"
 _AES_KEY = b"1234567812345678"
@@ -187,7 +189,7 @@ async def fetch_index_data_async(url: str, debug: bool = False) -> tuple[dict, d
     async with _client() as client:
         await client.get(url)
         if debug:
-            logger.debug(f"[fetcher] cookies: {dict(client.cookies)}")
+            logger.debug(f"[fetcher] url: {sanitize_url(url)}")
 
         login_data = await _login_check(client, params)
         if debug:
